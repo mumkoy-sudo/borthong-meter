@@ -7,13 +7,33 @@ import datetime
 import re
 import json
 
-# --- 1. การตั้งค่าและเชื่อมต่อ ---
+# ==========================================
+# ⚙️ ส่วนตั้งค่ารายชื่อห้อง (Master Data)
+# ==========================================
 KEY_FILE = 'credentials.json' 
 SHEET_NAME = 'Bothong_Meter_Data' 
 
-st.set_page_config(page_title="บ่อทอง เรสซิเด้นท์", page_icon="📝")
+# สร้างรายชื่อห้องตามข้อมูลที่แจ้งมา (รวม 269 ห้อง)
+# 🟢 โซนสีเขียว (เลข 1): 1001 - 1032 (32 ห้อง)
+zone_green = [str(x) for x in range(1001, 1033)]
 
-# เชื่อมต่อ Google Cloud & Sheet
+# 🟠 โซนสีส้ม (เลข 2): 2001 - 2058 (58 ห้อง)
+zone_orange = [str(x) for x in range(2001, 2059)]
+
+# 🔘 โซนสีเทา (เลข 3): 3001 - 3043 (43 ห้อง)
+zone_grey = [str(x) for x in range(3001, 3044)]
+
+# 🔵 โซนสีฟ้า (เลข 4): 4001 - 4136 (136 ห้อง)
+zone_blue = [str(x) for x in range(4001, 4137)]
+
+# รวมทั้งหมดเป็น Master List
+ALL_ROOMS = zone_green + zone_orange + zone_grey + zone_blue
+
+st.set_page_config(page_title="บ่อทอง เรสซิเด้นท์", page_icon="🏢")
+
+# ==========================================
+# 🔌 ส่วนเชื่อมต่อระบบ
+# ==========================================
 @st.cache_resource
 def init_connection():
     try:
@@ -42,35 +62,37 @@ def init_connection():
         st.error(f"เชื่อมต่อไม่สำเร็จ: {e}")
         return None, None
 
-# *** บรรทัดนี้สำคัญมาก (ที่หายไปคราวที่แล้ว) ***
 vision_client, sh = init_connection()
 
-# --- 2. สูตรแกะตัวเลข V.3 (ไม่ต้องใช้ cv2) ---
+# ==========================================
+# 🧠 ฟังก์ชันคำนวณและจัดการข้อมูล
+# ==========================================
+
 def get_text_from_image(image_bytes):
     if vision_client is None: return ""
     image = vision.Image(content=image_bytes)
-    # ใช้โหมด DOCUMENT_TEXT_DETECTION เพื่อให้อ่านตัวเลขที่ชิดกันได้ดีขึ้น
     response = vision_client.document_text_detection(image=image)
     if response.full_text_annotation:
         return response.full_text_annotation.text
     return ""
 
 def extract_numbers(text, m_type):
-    # 1. ล้างค่า Text ให้สะอาด
+    """
+    สูตรแกะตัวเลข V.4 (ใช้ Master Data ตรวจสอบ)
+    """
+    # 1. ทำความสะอาดข้อความ
     text_clean = text.replace('O', '0').replace('o', '0').replace('l', '1').replace('I', '1')
     text_merged = text_clean.replace(" ", "") 
     
-    # ดึงชุดตัวเลขทั้งหมดออกมา
     numbers_raw = re.findall(r'\d+', text_clean)
     numbers_merged = re.findall(r'\d+', text_merged)
-    
     all_candidates = set(numbers_raw + numbers_merged)
     
     suggested_room = ""
     suggested_meter = 0
     meter_candidates = []
     
-    # Blacklist เลขขยะ
+    # เลขขยะที่ต้องตัดทิ้ง
     ignore_list = [
         220, 50, 15, 45, 100, 400, 
         2023, 2024, 2025, 2552, 2336, 
@@ -78,84 +100,155 @@ def extract_numbers(text, m_type):
         1, 2, 33 
     ]
 
-    # ขั้นตอนที่ 1: หาเลขห้อง
+    # --- Priority 1: หาเลขห้องจาก Master List (ALL_ROOMS) ---
+    # ถ้าตัวเลขที่เจอ "มีอยู่จริง" ในรายชื่อห้อง ให้ฟันธงว่าเป็นเลขห้องทันที
+    found_rooms = []
     for num_str in all_candidates:
-        if len(num_str) == 4 and num_str.startswith("10"):
-            suggested_room = num_str
-            break 
+        if num_str in ALL_ROOMS:
+            found_rooms.append(num_str)
     
+    # ถ้าเจอเลขห้องใน List จริง
+    if found_rooms:
+        # ถ้าเจอหลายห้อง (เช่น เจอทั้ง 1001 และ 1002 ในรูปเดียว) ให้เดาว่าเป็นห้องที่อยู่ตรงกลางภาพ 
+        # (แต่ในที่นี้เอาตัวแรกไปก่อน หรือให้ user เลือกเองถ้าผิด)
+        suggested_room = found_rooms[0]
+    
+    # ถ้าไม่เจอใน List จริง (อาจจะอ่านผิดเพี้ยนไปบ้าง) ลองเดาจาก Pattern 4 หลัก
     if not suggested_room:
         for num_str in all_candidates:
-            if len(num_str) == 3 and int(num_str) < 500:
+            if len(num_str) == 4 and num_str.startswith(('1', '2', '3', '4')):
+                # ลองเช็คว่ามันใกล้เคียงกับห้องที่มีไหม (ข้ามไปก่อน เอาแค่รูปแบบ)
                 suggested_room = num_str
                 break
 
-    # ขั้นตอนที่ 2: หาเลขมิเตอร์
+    # --- Priority 2: หาเลขมิเตอร์ ---
     for num_str in all_candidates:
+        # ข้ามเลขห้องที่เจอไปแล้ว
         if num_str == suggested_room: continue
+        # ข้ามเลขสั้นๆ หรือยาวเกินไป
         if len(num_str) < 3: continue
+        if len(num_str) > 6: continue 
+        
         val = int(num_str)
         if val in ignore_list: continue
-        if len(num_str) > 6: continue # ตัด Serial Number ยาวๆ ทิ้ง
+        
         meter_candidates.append(val)
 
-    # ขั้นตอนที่ 3: เลือกเลขที่ดีที่สุด
     if meter_candidates:
         if m_type == 'ไฟฟ้า':
-            # ไฟฟ้า: เน้น 5 หลัก (10000-99999)
-            priority_candidates = [x for x in meter_candidates if 10000 <= x <= 99999]
-            if priority_candidates:
-                suggested_meter = max(priority_candidates)
-            else:
-                suggested_meter = max(meter_candidates)
+            # ไฟฟ้า เน้น 5 หลัก
+            priority = [x for x in meter_candidates if 10000 <= x <= 99999]
+            suggested_meter = max(priority) if priority else max(meter_candidates)
         else: 
-            # น้ำประปา: เน้น 4 หลัก
-            priority_candidates = [x for x in meter_candidates if 1000 <= x <= 9999]
-            if priority_candidates:
-                suggested_meter = max(priority_candidates)
-            else:
-                suggested_meter = max(meter_candidates)
+            # น้ำประปา เน้น 4 หลัก
+            priority = [x for x in meter_candidates if 1000 <= x <= 9999]
+            suggested_meter = max(priority) if priority else max(meter_candidates)
 
     return suggested_room, suggested_meter
 
-def get_last_reading(room, meter_type):
-    if sh is None: return 0
+def sort_latest_status():
+    if sh is None: return
     try:
-        worksheet = sh.worksheet("Latest_Status")
-        records = worksheet.get_all_records()
-        df = pd.DataFrame(records)
-        df['Room'] = df['Room'].astype(str)
-        room = str(room)
-        row = df[df['Room'] == room]
-        if not row.empty:
-            col_name = 'Last_Water' if meter_type == 'น้ำประปา' else 'Last_Elec'
-            return int(row.iloc[0][col_name])
-        return 0 
-    except: return 0
+        ws = sh.worksheet("Latest_Status")
+        data = ws.get_all_records()
+        if not data: return
+
+        df = pd.DataFrame(data)
+        try:
+            # แปลงเป็นตัวเลขเพื่อเรียงลำดับ (เพราะห้องเราเป็นตัวเลขทั้งหมดแล้ว)
+            df['Room_Int'] = df['Room'].astype(int)
+            df = df.sort_values(by='Room_Int')
+            df = df.drop(columns=['Room_Int'])
+        except:
+            df = df.sort_values(by='Room')
+
+        ws.clear()
+        ws.update([df.columns.values.tolist()] + df.values.tolist())
+    except Exception as e:
+        print(f"Sort Error: {e}")
 
 def save_data(room, m_type, prev, curr, usage):
     if sh is None: return
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
     log_sheet = sh.worksheet("Logs")
     log_sheet.append_row([timestamp, room, m_type, prev, curr, usage])
+    
     status_sheet = sh.worksheet("Latest_Status")
-    cell = status_sheet.find(str(room))
-    if cell:
-        col_index = 2 if m_type == 'น้ำประปา' else 3
-        status_sheet.update_cell(cell.row, col_index, curr)
-    else:
+    try:
+        cell = status_sheet.find(str(room))
+        if cell:
+            col_index = 2 if m_type == 'น้ำประปา' else 3
+            status_sheet.update_cell(cell.row, col_index, curr)
+        else:
+            new_water = curr if m_type == 'น้ำประปา' else 0
+            new_elec = curr if m_type == 'ไฟฟ้า' else 0
+            status_sheet.append_row([room, new_water, new_elec])
+    except:
         new_water = curr if m_type == 'น้ำประปา' else 0
         new_elec = curr if m_type == 'ไฟฟ้า' else 0
         status_sheet.append_row([room, new_water, new_elec])
+    
+    sort_latest_status()
 
-# --- 3. หน้าจอแอป (UI) ---
+def check_missing_rooms(meter_type):
+    if sh is None: return [], 0
+    try:
+        ws = sh.worksheet("Logs")
+        records = ws.get_all_records()
+        df = pd.DataFrame(records)
+        
+        current_month = datetime.datetime.now().strftime("%Y-%m")
+        df['Timestamp'] = df['Timestamp'].astype(str)
+        
+        filtered = df[
+            (df['Timestamp'].str.contains(current_month)) & 
+            (df['Type'] == meter_type)
+        ]
+        
+        recorded_rooms = set(filtered['Room'].astype(str).unique())
+        all_rooms_set = set(str(r) for r in ALL_ROOMS)
+        
+        missing = sorted(list(all_rooms_set - recorded_rooms), key=lambda x: int(x))
+        total_recorded = len(recorded_rooms)
+        
+        return missing, total_recorded
+    except:
+        return ALL_ROOMS, 0
+
+# ==========================================
+# 📱 ส่วนหน้าจอแอป (UI)
+# ==========================================
 st.title("💧⚡ บ่อทอง เรสซิเด้นท์")
 
 if sh is None:
     st.warning("⚠️ กำลังเชื่อมต่อระบบ...")
 else:
     meter_type = st.radio("เลือกประเภท:", ["น้ำประปา", "ไฟฟ้า"], horizontal=True)
-    
+
+    # --- ส่วนตรวจสอบความคืบหน้า (Dashboard) ---
+    with st.expander(f"📊 ตรวจสอบยอดจดมิเตอร์ ({meter_type})", expanded=True):
+        missing_list, count_done = check_missing_rooms(meter_type)
+        total_rooms = len(ALL_ROOMS)
+        
+        # Progress Bar
+        progress = count_done / total_rooms if total_rooms > 0 else 0
+        st.progress(progress)
+        st.write(f"✅ จดไปแล้ว: **{count_done}** / {total_rooms} ห้อง")
+        
+        if missing_list:
+            st.warning(f"❌ เหลืออีก: **{len(missing_list)}** ห้อง")
+            # แสดงรายชื่อห้องที่ขาด แบบย่อๆ (ถ้าเยอะเกินให้ซ่อน)
+            if len(missing_list) > 20:
+                st.caption(f"ตัวอย่างห้องที่ขาด: {', '.join(missing_list[:10])} ... และอีก {len(missing_list)-10} ห้อง")
+            else:
+                st.info(f"ห้องที่ขาด: {', '.join(missing_list)}")
+        else:
+            st.success("🎉 สุดยอด! ครบทุกห้องแล้วครับ")
+
+    st.divider()
+
+    # --- ส่วนถ่ายรูป / อัปโหลด ---
     tab1, tab2 = st.tabs(["📸 ถ่ายรูป", "📂 อัปโหลดรูป"])
     img_file = None
     
@@ -171,49 +264,60 @@ else:
 
     ai_room = ""
     ai_reading = 0
-    raw_text_debug = ""
 
     if img_file:
         bytes_data = img_file.getvalue()
-        with st.spinner('🤖 AI กำลังแกะรอยตัวเลข (สูตร V.3)...'):
-            raw_text_debug = get_text_from_image(bytes_data)
-            ai_room, ai_reading = extract_numbers(raw_text_debug, meter_type)
+        with st.spinner('🤖 AI กำลังอ่านค่า (ตรวจสอบรายชื่อห้องจริง)...'):
+            raw_text = get_text_from_image(bytes_data)
+            ai_room, ai_reading = extract_numbers(raw_text, meter_type)
         
-        st.success("อ่านค่าเรียบร้อย! (กรุณาตรวจสอบก่อนบันทึก)")
-        with st.expander("🔍 ดูสิ่งที่ AI อ่านได้ทั้งหมด"):
-            st.text(raw_text_debug)
+        if ai_room in ALL_ROOMS:
+            st.success(f"✅ AI เจอห้อง {ai_room} ในระบบ!")
+        elif ai_room:
+            st.warning(f"⚠️ AI อ่านได้เลข {ai_room} แต่ไม่พบในรายชื่อห้อง (โปรดตรวจสอบ)")
+        else:
+            st.warning("⚠️ AI ไม่เห็นเลขห้องที่ชัดเจน")
 
+    # --- แบบฟอร์มบันทึก ---
     with st.form("meter_form"):
-        st.caption("👇 ตรวจสอบและแก้ไขตัวเลขได้ที่นี่")
         c1, c2 = st.columns(2)
-        room_number = c1.text_input("เลขห้อง (ป้ายเหลือง)", value=ai_room)
-        
-        current_reading = c2.number_input(
-            "เลขมิเตอร์", 
-            min_value=0, 
-            value=ai_reading, 
-            help="ถ้าเลขกำลังหมุน ให้ปัดเศษลง (ใช้ค่าน้อยกว่า)"
-        )
+        room_number = c1.text_input("เลขห้อง", value=ai_room)
+        current_reading = c2.number_input("เลขมิเตอร์", min_value=0, value=ai_reading)
         
         prev = 0
         usage = 0
         
         if room_number:
-            prev = get_last_reading(room_number, meter_type)
+            # ดึงค่าเก่า
+            try:
+                ws_status = sh.worksheet("Latest_Status")
+                records = ws_status.get_all_records()
+                df_status = pd.DataFrame(records)
+                df_status['Room'] = df_status['Room'].astype(str)
+                row = df_status[df_status['Room'] == str(room_number)]
+                if not row.empty:
+                    col_name = 'Last_Water' if meter_type == 'น้ำประปา' else 'Last_Elec'
+                    prev = int(row.iloc[0][col_name])
+            except:
+                prev = 0
+
             st.info(f"ครั้งก่อน: **{prev}**")
             
             if current_reading >= prev: 
                 usage = current_reading - prev
             else: 
-                st.warning("⚠️ เลขปัจจุบันน้อยกว่าครั้งก่อน (จดผิดหรือเปล่าครับ?)")
+                st.warning("⚠️ เลขปัจจุบันน้อยกว่าครั้งก่อน (ตรวจสอบอีกครั้ง)")
                 usage = current_reading 
             
             st.metric("หน่วยที่ใช้", usage)
 
         if st.form_submit_button("💾 บันทึกข้อมูล"):
-            if room_number and current_reading > 0:
+            # ตรวจสอบว่าห้องถูกต้องไหม
+            if room_number not in ALL_ROOMS:
+                st.error(f"❌ ห้อง {room_number} ไม่อยู่ในรายชื่อโครงการ! (กรุณาแก้เลขห้องให้ถูก)")
+            elif current_reading <= 0:
+                st.error("❌ เลขมิเตอร์ต้องมากกว่า 0")
+            else:
                 save_data(room_number, meter_type, prev, current_reading, usage)
                 st.success(f"บันทึกห้อง {room_number} เรียบร้อย!")
-                st.balloons()
-            else:
-                st.error("กรุณากรอกข้อมูลให้ครบ (เลขห้อง และ เลขมิเตอร์)")
+                st.rerun()
