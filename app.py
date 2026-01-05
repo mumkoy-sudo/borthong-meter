@@ -1,52 +1,185 @@
+import streamlit as st
+import pandas as pd
+from google.cloud import vision
+from google.oauth2 import service_account
+import gspread
+import datetime
+import re
+import json
+
+# --- 1. การตั้งค่าและเชื่อมต่อ (Configuration) ---
+KEY_FILE = 'credentials.json' 
+SHEET_NAME = 'Bothong_Meter_Data' 
+
+st.set_page_config(page_title="บ่อทอง เรสซิเด้นท์", page_icon="📝")
+
+# ฟังก์ชันเชื่อมต่อ Google Cloud & Sheet
+@st.cache_resource
+def init_connection():
+    try:
+        my_scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/cloud-platform"
+        ]
+        
+        creds = None
+        # เช็คว่ารันบน Cloud หรือ คอมตัวเอง
+        if "gcp_service_account" in st.secrets:
+            creds = service_account.Credentials.from_service_account_info(
+                st.secrets["gcp_service_account"], scopes=my_scopes
+            )
+        else:
+            creds = service_account.Credentials.from_service_account_file(
+                KEY_FILE, scopes=my_scopes
+            )
+        
+        vision_client = vision.ImageAnnotatorClient(credentials=creds)
+        gc = gspread.authorize(creds)
+        sh = gc.open(SHEET_NAME)
+        
+        return vision_client, sh
+    except Exception as e:
+        st.error(f"เชื่อมต่อไม่สำเร็จ: {e}")
+        return None, None
+
+vision_client, sh = init_connection()
+
+# --- 2. ฟังก์ชันช่วยงาน (Logic ใหม่ที่ปรับปรุงแล้ว) ---
+def get_text_from_image(image_bytes):
+    if vision_client is None: return ""
+    image = vision.Image(content=image_bytes)
+    response = vision_client.text_detection(image=image)
+    texts = response.text_annotations
+    if texts: return texts[0].description
+    return ""
+
 def extract_numbers(text):
-    """แกะตัวเลขโดยปรับสูตรให้เข้ากับมิเตอร์บ่อทอง"""
-    # 1. ทำความสะอาดข้อความ ลบตัวอักษรแปลกๆ
-    text = text.replace('O', '0').replace('o', '0') # แก้ O เป็น 0 เผื่อ AI อ่านผิด
+    """สูตรแกะตัวเลขฉบับบ่อทอง (ปรับปรุงใหม่)"""
+    # ลบตัวอักษรที่ชอบอ่านผิด
+    text = text.replace('O', '0').replace('o', '0') 
     
-    # 2. หาชุดตัวเลขทั้งหมดในภาพ
+    # ดึงตัวเลขทั้งหมดออกมา
     numbers = re.findall(r'\d+', text)
     
     suggested_room = ""
     suggested_meter = 0
-    
     candidates = []
     
-    # 3. กรองตัวเลข (Filter)
+    # ขั้นตอนที่ 1: คัดกรองเบื้องต้น
     for num_str in numbers:
-        # ลบเลข 0 นำหน้า (เช่น 0145 -> 145)
         val = int(num_str)
-        
-        # --- กฎการตัดเลขขยะ (Noise Filter) ---
-        # ถ้าเจอเลขพวกนี้ ให้ข้ามไปเลย (เลข Voltage, Hz, ปีผลิต, มอก.)
+        # กรองเลขขยะออก (Voltage, Hz, ปีผลิต, มอก.)
         if val in [220, 50, 15, 45, 2023, 2024, 2025, 2552, 2336]:
             continue
-            
-        # เก็บตัวเลขที่น่าสนใจไว้ (ต้องมี 3 หลักขึ้นไป)
+        # เก็บเลขที่มี 3 หลักขึ้นไป
         if len(num_str) >= 3:
             candidates.append(num_str)
 
-    # 4. ตามหาเลขห้อง (Priority 1)
-    # กฎ: เลขห้องของบ่อทอง น่าจะเป็น 4 หลัก และขึ้นต้นด้วย "10" (เช่น 1018, 1020)
+    # ขั้นตอนที่ 2: ตามหาเลขห้อง (เน้นหา 4 หลักที่ขึ้นต้นด้วย 10)
     for c in candidates:
         if len(c) == 4 and c.startswith("10"):
             suggested_room = c
-            candidates.remove(c) # เจอแล้วลบออกจากกองกลาง
-            break # เจอแล้วหยุดหา
+            candidates.remove(c)
+            break 
     
-    # ถ้าหาแบบ 4 หลักไม่เจอ ลองหาแบบ 3 หลัก (เผื่อมีห้อง 101-999)
+    # ถ้าไม่เจอ 4 หลัก ให้ลองหาแบบ 3 หลัก (ค่าน้อยกว่า 500)
     if not suggested_room:
         for c in candidates:
-            if len(c) == 3 and int(c) < 500: # สมมติว่าห้องไม่เกิน 500
+            if len(c) == 3 and int(c) < 500:
                 suggested_room = c
                 candidates.remove(c)
                 break
 
-    # 5. ตามหาเลขมิเตอร์ (Priority 2)
-    # เอาตัวเลขที่เหลือ มาดูว่าตัวไหนค่ามากที่สุด หรือดูเป็นไปได้มากที่สุด
+    # ขั้นตอนที่ 3: ตามหาเลขมิเตอร์ (เอาตัวเลขที่เหลือที่ค่ามากที่สุด)
     if candidates:
-        # แปลงเป็นตัวเลขแล้วหาตัวที่ดูเป็นมิเตอร์ที่สุด (ส่วนใหญ่เลขมิเตอร์จะเยอะกว่าเลขห้อง)
-        # หรือถ้าเหลือตัวเดียว ก็เอาตัวนั้นเลย
         possible_meters = [int(x) for x in candidates]
-        suggested_meter = max(possible_meters) # เดาว่าเลขมิเตอร์น่าจะค่าสูงสุดที่เหลืออยู่
+        suggested_meter = max(possible_meters)
 
     return suggested_room, suggested_meter
+
+def get_last_reading(room, meter_type):
+    if sh is None: return 0
+    try:
+        worksheet = sh.worksheet("Latest_Status")
+        records = worksheet.get_all_records()
+        df = pd.DataFrame(records)
+        df['Room'] = df['Room'].astype(str)
+        room = str(room)
+        row = df[df['Room'] == room]
+        if not row.empty:
+            col_name = 'Last_Water' if meter_type == 'น้ำประปา' else 'Last_Elec'
+            return int(row.iloc[0][col_name])
+        return 0 
+    except: return 0
+
+def save_data(room, m_type, prev, curr, usage):
+    if sh is None: return
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_sheet = sh.worksheet("Logs")
+    log_sheet.append_row([timestamp, room, m_type, prev, curr, usage])
+    status_sheet = sh.worksheet("Latest_Status")
+    cell = status_sheet.find(str(room))
+    if cell:
+        col_index = 2 if m_type == 'น้ำประปา' else 3
+        status_sheet.update_cell(cell.row, col_index, curr)
+    else:
+        new_water = curr if m_type == 'น้ำประปา' else 0
+        new_elec = curr if m_type == 'ไฟฟ้า' else 0
+        status_sheet.append_row([room, new_water, new_elec])
+
+# --- 3. หน้าจอแอป (UI) ---
+st.title("💧⚡ บ่อทอง เรสซิเด้นท์")
+
+if sh is None:
+    st.warning("⚠️ กำลังเชื่อมต่อระบบ...")
+else:
+    meter_type = st.radio("เลือกประเภท:", ["น้ำประปา", "ไฟฟ้า"], horizontal=True)
+    
+    # ระบบเลือกแท็บ (ถ่ายรูป / อัปโหลด)
+    tab1, tab2 = st.tabs(["📸 ถ่ายรูป", "📂 อัปโหลดรูป"])
+    img_file = None
+    
+    with tab1:
+        camera_img = st.camera_input(f"ถ่ายรูปมิเตอร์{meter_type}")
+        if camera_img: img_file = camera_img
+
+    with tab2:
+        uploaded_img = st.file_uploader(f"เลือกรูปมิเตอร์{meter_type} จากเครื่อง", type=['jpg', 'png', 'jpeg'])
+        if uploaded_img: 
+            st.image(uploaded_img, caption="รูปที่เลือก", width=300)
+            img_file = uploaded_img
+
+    ai_room = ""
+    ai_reading = 0
+
+    if img_file:
+        bytes_data = img_file.getvalue()
+        with st.spinner('🤖 AI กำลังอ่านค่า (สูตรใหม่)...'):
+            raw_text = get_text_from_image(bytes_data)
+            ai_room, ai_reading = extract_numbers(raw_text)
+        
+        # แสดงผลการอ่านแบบ Debug (เผื่ออยากดูว่ามันเห็นเลขอะไรบ้าง)
+        with st.expander("ดูข้อความดิบที่ AI อ่านได้"):
+            st.text(raw_text)
+            
+        st.success("อ่านค่าเรียบร้อย!")
+
+    with st.form("meter_form"):
+        c1, c2 = st.columns(2)
+        room_number = c1.text_input("เลขห้อง", value=ai_room)
+        current_reading = c2.number_input("เลขมิเตอร์", min_value=0, value=ai_reading)
+        
+        prev = 0
+        usage = 0
+        if room_number:
+            prev = get_last_reading(room_number, meter_type)
+            st.info(f"ครั้งก่อน: **{prev}**")
+            if current_reading >= prev: usage = current_reading - prev
+            else: usage = current_reading 
+            st.metric("หน่วยที่ใช้", usage)
+
+        if st.form_submit_button("💾 บันทึก"):
+            save_data(room_number, meter_type, prev, current_reading, usage)
+            st.success(f"บันทึกห้อง {room_number} เรียบร้อย!")
+            st.balloons()
