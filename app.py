@@ -17,7 +17,6 @@ st.set_page_config(page_title="บ่อทอง เรสซิเด้นท
 @st.cache_resource
 def init_connection():
     try:
-        # กำหนดขอบเขตสิทธิ์
         my_scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
@@ -25,19 +24,16 @@ def init_connection():
         ]
         
         creds = None
-        # เช็คว่ารันบน Cloud หรือ คอมตัวเอง
+        # เช็คว่ารันบน Cloud (Secrets) หรือ คอมตัวเอง (File)
         if "gcp_service_account" in st.secrets:
-            # กรณีอยู่บน Cloud (อ่านจาก Secrets)
             creds = service_account.Credentials.from_service_account_info(
                 st.secrets["gcp_service_account"], scopes=my_scopes
             )
         else:
-            # กรณีอยู่บนคอมตัวเอง (อ่านจากไฟล์ json)
             creds = service_account.Credentials.from_service_account_file(
                 KEY_FILE, scopes=my_scopes
             )
         
-        # เชื่อมต่อ
         vision_client = vision.ImageAnnotatorClient(credentials=creds)
         gc = gspread.authorize(creds)
         sh = gc.open(SHEET_NAME)
@@ -99,24 +95,40 @@ def save_data(room, m_type, prev, curr, usage):
         new_elec = curr if m_type == 'ไฟฟ้า' else 0
         status_sheet.append_row([room, new_water, new_elec])
 
-# --- 3. หน้าจอแอป ---
+# --- 3. หน้าจอแอป (UI) ---
 st.title("💧⚡ บ่อทอง เรสซิเด้นท์")
 
 if sh is None:
-    st.warning("⚠️ กำลังเชื่อมต่อ...")
+    st.warning("⚠️ กำลังเชื่อมต่อระบบ...")
 else:
     meter_type = st.radio("เลือกประเภท:", ["น้ำประปา", "ไฟฟ้า"], horizontal=True)
-    img_file = st.camera_input(f"📸 ถ่ายรูปมิเตอร์{meter_type}")
+    
+    # --- ส่วนที่แก้ไข: เพิ่ม Tabs ให้เลือก ---
+    tab1, tab2 = st.tabs(["📸 ถ่ายรูป", "📂 อัปโหลดรูป"])
+    
+    img_file = None
+    
+    with tab1:
+        camera_img = st.camera_input(f"ถ่ายรูปมิเตอร์{meter_type}")
+        if camera_img: img_file = camera_img
+
+    with tab2:
+        uploaded_img = st.file_uploader(f"เลือกรูปมิเตอร์{meter_type} จากเครื่อง", type=['jpg', 'png', 'jpeg'])
+        if uploaded_img: 
+            st.image(uploaded_img, caption="รูปที่เลือก", width=300)
+            img_file = uploaded_img
+            
+    # --- จบส่วนแก้ไข ---
 
     ai_room = ""
     ai_reading = 0
 
     if img_file:
         bytes_data = img_file.getvalue()
-        with st.spinner('🤖 AI กำลังอ่าน...'):
+        with st.spinner('🤖 AI กำลังอ่านค่า...'):
             raw_text = get_text_from_image(bytes_data)
             ai_room, ai_reading = extract_numbers(raw_text)
-        st.success("อ่านเสร็จสิ้น!")
+        st.success("อ่านค่าจากรูปเสร็จสิ้น!")
 
     with st.form("meter_form"):
         c1, c2 = st.columns(2)
@@ -135,3 +147,4 @@ else:
         if st.form_submit_button("💾 บันทึก"):
             save_data(room_number, meter_type, prev, current_reading, usage)
             st.success(f"บันทึกห้อง {room_number} เรียบร้อย!")
+            st.balloons()
