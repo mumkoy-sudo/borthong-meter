@@ -42,20 +42,25 @@ def init_connection():
         st.error(f"เชื่อมต่อไม่สำเร็จ: {e}")
         return None, None
 
-# --- 2. สูตรแกะตัวเลข V.3 ---
+# *** บรรทัดนี้สำคัญมาก (ที่หายไปคราวที่แล้ว) ***
+vision_client, sh = init_connection()
+
+# --- 2. สูตรแกะตัวเลข V.3 (ไม่ต้องใช้ cv2) ---
 def get_text_from_image(image_bytes):
     if vision_client is None: return ""
     image = vision.Image(content=image_bytes)
+    # ใช้โหมด DOCUMENT_TEXT_DETECTION เพื่อให้อ่านตัวเลขที่ชิดกันได้ดีขึ้น
     response = vision_client.document_text_detection(image=image)
     if response.full_text_annotation:
         return response.full_text_annotation.text
     return ""
 
 def extract_numbers(text, m_type):
-    # เปลี่ยนตัวโอเป็นเลข 0, ลบตัวอักษรขยะ
+    # 1. ล้างค่า Text ให้สะอาด
     text_clean = text.replace('O', '0').replace('o', '0').replace('l', '1').replace('I', '1')
     text_merged = text_clean.replace(" ", "") 
     
+    # ดึงชุดตัวเลขทั้งหมดออกมา
     numbers_raw = re.findall(r'\d+', text_clean)
     numbers_merged = re.findall(r'\d+', text_merged)
     
@@ -65,6 +70,7 @@ def extract_numbers(text, m_type):
     suggested_meter = 0
     meter_candidates = []
     
+    # Blacklist เลขขยะ
     ignore_list = [
         220, 50, 15, 45, 100, 400, 
         2023, 2024, 2025, 2552, 2336, 
@@ -72,7 +78,7 @@ def extract_numbers(text, m_type):
         1, 2, 33 
     ]
 
-    # หาเลขห้อง (Priority 1)
+    # ขั้นตอนที่ 1: หาเลขห้อง
     for num_str in all_candidates:
         if len(num_str) == 4 and num_str.startswith("10"):
             suggested_room = num_str
@@ -84,24 +90,26 @@ def extract_numbers(text, m_type):
                 suggested_room = num_str
                 break
 
-    # หาเลขมิเตอร์
+    # ขั้นตอนที่ 2: หาเลขมิเตอร์
     for num_str in all_candidates:
         if num_str == suggested_room: continue
         if len(num_str) < 3: continue
         val = int(num_str)
         if val in ignore_list: continue
-        if len(num_str) > 6: continue
+        if len(num_str) > 6: continue # ตัด Serial Number ยาวๆ ทิ้ง
         meter_candidates.append(val)
 
-    # เลือกเลขมิเตอร์ที่ดีที่สุด
+    # ขั้นตอนที่ 3: เลือกเลขที่ดีที่สุด
     if meter_candidates:
         if m_type == 'ไฟฟ้า':
+            # ไฟฟ้า: เน้น 5 หลัก (10000-99999)
             priority_candidates = [x for x in meter_candidates if 10000 <= x <= 99999]
             if priority_candidates:
                 suggested_meter = max(priority_candidates)
             else:
                 suggested_meter = max(meter_candidates)
-        else: # น้ำประปา
+        else: 
+            # น้ำประปา: เน้น 4 หลัก
             priority_candidates = [x for x in meter_candidates if 1000 <= x <= 9999]
             if priority_candidates:
                 suggested_meter = max(priority_candidates)
